@@ -1,0 +1,367 @@
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+
+import '../../../core/download_support.dart';
+import '../../../core/fullscreen.dart';
+import '../../../core/theme/app_theme.dart';
+import '../../../state/catalog_refresh.dart';
+import '../../../state/live_providers.dart'
+    show expiryDateProvider, liveCategoriesProvider;
+import '../../../state/series_providers.dart' show seriesCategoriesProvider;
+import '../../../state/vod_providers.dart' show vodCategoriesProvider;
+import '../../common/app_dialogs.dart';
+import '../../common/app_logo.dart';
+import '../../common/support_contact_bar.dart';
+import '../../common/tv_focusable.dart';
+
+class HomeScreen extends ConsumerWidget {
+  const HomeScreen({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    // Instantiate the refresher so its 24h auto-refresh timer runs.
+    ref.watch(catalogRefreshProvider);
+    // Warm the three catalogs in the background: on slow panels (tens of
+    // seconds per call) the fetch starts now instead of on the first tap on
+    // TV/Film/Serie. read(...) doesn't subscribe, and the FutureProviders
+    // cache the in-flight future, so repeated builds are no-ops. Errors are
+    // ignored here — the catalog screens surface them with a retry.
+    ref.read(liveCategoriesProvider.future).ignore();
+    ref.read(vodCategoriesProvider.future).ignore();
+    ref.read(seriesCategoriesProvider.future).ignore();
+    final isFullscreen = ref.watch(fullscreenProvider);
+
+    // The home is the root route: a system Back here would kill the app cold.
+    // Ask first (app-themed dialog, D-pad friendly) — mainly for TV remotes.
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) async {
+        if (didPop) return;
+        final exit = await showAppConfirmDialog(
+          context,
+          title: 'Exit BellaTV?',
+          message: 'Do you want to close the app?',
+          confirmLabel: 'Exit',
+        );
+        if (exit) SystemNavigator.pop();
+      },
+      child: Scaffold(
+      appBar: AppBar(
+        titleSpacing: 20,
+        centerTitle: true,
+        title: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const AppLogo(size: 30),
+            const SizedBox(width: 12),
+            Text('BellaTV', style: Theme.of(context).textTheme.titleLarge),
+          ],
+        ),
+        actions: [
+          IconButton(
+            tooltip: 'Search',
+            icon: const Icon(Icons.search),
+            onPressed: () => context.push('/search'),
+          ),
+          // Offline downloads: phone (touch) mode on the APK only.
+          if (downloadsSupported())
+            IconButton(
+              tooltip: 'Downloads',
+              icon: const Icon(Icons.download_outlined),
+              onPressed: () => context.push('/downloads'),
+            ),
+          // Windows only: on Android the app is permanently fullscreen.
+          if (fullscreenToggleAvailable)
+            IconButton(
+              tooltip: isFullscreen ? 'Exit Fullscreen' : 'Fullscreen',
+              icon: Icon(isFullscreen ? Icons.fullscreen_exit : Icons.fullscreen),
+              onPressed: () => ref.read(fullscreenProvider.notifier).toggle(),
+            ),
+          IconButton(
+            tooltip: 'Settings',
+            icon: const Icon(Icons.settings_outlined),
+            onPressed: () => context.push('/settings'),
+          ),
+        ],
+      ),
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          // Size tiles to the available space so three always fit, whatever
+          // the window/screen size.
+          final w = constraints.maxWidth;
+          final h = constraints.maxHeight;
+          final horizontalPadding = (w * 0.04).clamp(12.0, 48.0);
+          final gap = (w * 0.02).clamp(8.0, 24.0);
+          final usableW = w - horizontalPadding * 2 - gap * 2;
+          final tileW = usableW / 3;
+          final tileH = (h * 0.62).clamp(120.0, tileW * 1.25);
+
+          return Column(
+            children: [
+              Expanded(
+                child: Center(
+                  child: Padding(
+                    padding: EdgeInsets.symmetric(horizontal: horizontalPadding),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        _HomeTile(
+                          label: 'Live TV',
+                          icon: Icons.live_tv_rounded,
+                          gradientColors: const [AppColors.redLight, AppColors.redDark],
+                          glowColor: AppColors.red,
+                          width: tileW,
+                          height: tileH,
+                          // D-pad: land on TV when the home opens.
+                          autofocus: true,
+                          onTap: () => context.push('/live'),
+                        ),
+                        SizedBox(width: gap),
+                        _HomeTile(
+                          label: 'Series',
+                          icon: Icons.video_library_rounded,
+                          gradientColors: const [Color(0xFFE8B84B), AppColors.red],
+                          glowColor: AppColors.goldDark,
+                          width: tileW,
+                          height: tileH,
+                          onTap: () => context.push('/series'),
+                        ),
+                        SizedBox(width: gap),
+                        _HomeTile(
+                          label: 'Movies',
+                          icon: Icons.local_movies_rounded,
+                          gradientColors: const [AppColors.goldLight, AppColors.goldDark],
+                          glowColor: AppColors.gold,
+                          width: tileW,
+                          height: tileH,
+                          onTap: () => context.push('/vod'),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+              const _ExpiryLine(),
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: _RefreshButton(),
+              ),
+              // Customer-service strip (number + Call + WhatsApp), width-capped
+              // so it doesn't stretch across a wide TV screen.
+              Padding(
+                padding: const EdgeInsets.only(top: 4, bottom: 16, left: 20, right: 20),
+                child: Center(
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 460),
+                    child: const SupportContactBar(compact: true),
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
+        ),
+      ),
+    );
+  }
+}
+
+/// A round, glossy, color-coded tile for one of the three main sections.
+/// The circle's gradient + glow are chosen per section so each one reads at a
+/// glance (red = live, gold = movies, red/gold blend = series), on top of the
+/// app's black/red/gold identity.
+class _HomeTile extends StatelessWidget {
+  const _HomeTile({
+    required this.label,
+    required this.icon,
+    required this.gradientColors,
+    required this.glowColor,
+    required this.width,
+    required this.height,
+    required this.onTap,
+    this.autofocus = false,
+  });
+
+  final String label;
+  final IconData icon;
+  final List<Color> gradientColors;
+  final Color glowColor;
+  final double width;
+  final double height;
+  final VoidCallback onTap;
+  final bool autofocus;
+
+  @override
+  Widget build(BuildContext context) {
+    final circleSize = width.clamp(90.0, height * 0.72);
+    final iconSize = (circleSize * 0.42).clamp(28.0, 64.0);
+    final fontSize = (width * 0.13).clamp(17.0, 26.0);
+
+    return SizedBox(
+      width: width,
+      height: height,
+      child: TvFocusable(
+        borderRadius: circleSize / 2 + 10,
+        autofocus: autofocus,
+        onTap: onTap,
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Container(
+              width: circleSize,
+              height: circleSize,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                gradient: LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: gradientColors,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: glowColor.withValues(alpha: 0.55),
+                    blurRadius: 24,
+                    spreadRadius: 1,
+                  ),
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.4),
+                    blurRadius: 10,
+                    offset: const Offset(0, 6),
+                  ),
+                ],
+              ),
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  // Glossy highlight: a soft white sheen in the upper-left,
+                  // like light reflecting off a polished sphere.
+                  Positioned(
+                    top: circleSize * 0.10,
+                    left: circleSize * 0.14,
+                    child: Container(
+                      width: circleSize * 0.5,
+                      height: circleSize * 0.32,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        gradient: RadialGradient(
+                          colors: [
+                            Colors.white.withValues(alpha: 0.55),
+                            Colors.white.withValues(alpha: 0.0),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                  Icon(icon, size: iconSize, color: Colors.white),
+                ],
+              ),
+            ),
+            SizedBox(height: height * 0.06),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: fontSize,
+                fontWeight: FontWeight.w700,
+                color: AppColors.textPrimary,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+String formatExpiry(DateTime d) {
+  final local = d.toLocal();
+  final dd = local.day.toString().padLeft(2, '0');
+  final mm = local.month.toString().padLeft(2, '0');
+  final hh = local.hour.toString().padLeft(2, '0');
+  final mi = local.minute.toString().padLeft(2, '0');
+  return '$dd/$mm/${local.year} $hh:$mi';
+}
+
+class _ExpiryLine extends ConsumerWidget {
+  const _ExpiryLine();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final expiry = ref.watch(expiryDateProvider);
+    return expiry.maybeWhen(
+      data: (date) {
+        if (date == null) return const SizedBox.shrink();
+        return Padding(
+          padding: const EdgeInsets.only(top: 4),
+          child: Text(
+            'Subscription valid until ${formatExpiry(date)}',
+            style: const TextStyle(color: AppColors.textSecondary, fontSize: 13),
+          ),
+        );
+      },
+      orElse: () => const SizedBox.shrink(),
+    );
+  }
+}
+
+class _RefreshButton extends ConsumerStatefulWidget {
+  @override
+  ConsumerState<_RefreshButton> createState() => _RefreshButtonState();
+}
+
+class _RefreshButtonState extends ConsumerState<_RefreshButton> {
+  // Transient outcome shown inside the button itself (no snackbar).
+  String? _result;
+  bool _ok = true;
+  Timer? _resetTimer;
+
+  @override
+  void dispose() {
+    _resetTimer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _doRefresh() async {
+    final error = await ref.read(catalogRefreshProvider).refreshNow();
+    if (!mounted) return;
+    setState(() {
+      _ok = error == null;
+      _result = error == null ? 'List updated' : 'Update failed';
+    });
+    _resetTimer?.cancel();
+    _resetTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted) setState(() => _result = null);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final refreshing = ref.watch(catalogRefreshingProvider);
+    final label = refreshing ? 'Updating...' : (_result ?? 'Refresh list');
+    final Widget icon;
+    if (refreshing) {
+      icon = const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2));
+    } else if (_result != null) {
+      icon = Icon(_ok ? Icons.check_circle_outline : Icons.error_outline);
+    } else {
+      icon = const Icon(Icons.refresh);
+    }
+
+    return TvFocusable(
+      borderRadius: 14,
+      onTap: refreshing ? () {} : _doRefresh,
+      // The TvFocusable is the one D-pad node: the inner button must not be a
+      // second focus stop (mouse clicks still reach it).
+      child: ExcludeFocus(
+        child: OutlinedButton.icon(
+          onPressed: refreshing ? null : _doRefresh,
+          icon: icon,
+          label: Text(label),
+        ),
+      ),
+    );
+  }
+}
